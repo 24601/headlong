@@ -1,5 +1,12 @@
-# NOTE: deploy/terraform-slack is an intentional sibling copy of this stack
-# (see the header there). If you fix something here, fix it there too.
+# deploy/terraform-slack — dedicated instance for the Slack persona.
+#
+# Intentional sibling COPY of deploy/terraform (the demo stack), not a shared
+# module: modularizing would force state surgery on the live demo instance,
+# and a shared user_data template rendering differently would rebuild it
+# (user_data_replace_on_change). If you fix something here, fix it there too.
+#
+# Slack-specific deltas: subdomain/env_parameter values in terraform.tfvars,
+# and user_data.sh.tpl installs + restarts the shellm-slack-* units.
 
 terraform {
   required_version = ">= 1.5"
