@@ -38,5 +38,24 @@ else
     ok "skill embeds no secret-bearing or local configuration"
 fi
 
+if grep -q 'gbrain engine status --json' "$SKILL" \
+    && grep -q 'gbrain call recall' "$SKILL" \
+    && grep -q 'gbrain remember .*--provenance .*--visibility private' "$SKILL" \
+    && grep -q 'gbrain call extract_facts' "$SKILL"; then
+    ok "skill documents the intended read and explicit-write commands"
+else
+    bad "skill documents the intended read and explicit-write commands"
+fi
+
+if grep -q 'Do not autonomously save ordinary thoughts' "$SKILL" \
+    && grep -q 'never as executable' "$SKILL" \
+    && grep -q 'paid,' "$SKILL" \
+    && grep -q 'source_slug' "$SKILL" \
+    && grep -q 'session_id' "$SKILL"; then
+    ok "skill pins autonomy, injection, cost, and provenance boundaries"
+else
+    bad "skill pins autonomy, injection, cost, and provenance boundaries"
+fi
+
 printf '\nResults: %d passed, %d failed\n' "$pass" "$fail"
 [[ "$fail" -eq 0 ]]
