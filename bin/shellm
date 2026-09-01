@@ -1712,6 +1712,8 @@ call_llm() {
                     .error.param?,
                     .error.code?,
                     .error.message?,
+                    .param?,
+                    .code?,
                     .message?,
                     .detail?
                 ]
@@ -2704,41 +2706,64 @@ run_loop() {
         fi
         rm -f "$thinking_file"
 
-        # Retry on empty response: feed captured thinking back as assistant
-        # context so the model continues from where it left off (max_tokens
-        # gets hit during thinking before any visible output is emitted).
+        # Retry on empty Chat output by feeding captured thinking back as
+        # assistant context. Responses mode keeps reasoning in the terminal
+        # Response item: continue from its ID/exact replay instead of inventing
+        # an assistant message containing a reasoning summary.
         # Default: 8 retries; SHELLM_EMPTY_RESPONSE_RETRIES overrides (set it
         # to the empty string for unlimited).
         local empty_retries=0
         local max_empty_retries="${SHELLM_EMPTY_RESPONSE_RETRIES-8}"
         local retry_messages_json="$messages_json"
         while [[ -z "$response" ]]; do
+            if [[ "$SHELLM_API_FORMAT" == "responses" ]]; then
+                if [[ -z "${SHELLM_RESPONSE_FILE:-}" || ! -s "$SHELLM_RESPONSE_FILE" ]]; then
+                    die "Empty Responses output without a terminal Response object"
+                fi
+                if jq -e '.output[]? | select(.type == "function_call")' \
+                    "$SHELLM_RESPONSE_FILE" >/dev/null 2>&1; then
+                    die "Responses returned function calls without visible shellm output; consume them through LLM_RESPONSE_FILE"
+                fi
+                if ! jq -e '
+                    .status == "incomplete"
+                    and .incomplete_details.reason == "max_output_tokens"
+                ' "$SHELLM_RESPONSE_FILE" >/dev/null 2>&1; then
+                    local response_status
+                    response_status=$(jq -r '.status // "unknown"' \
+                        "$SHELLM_RESPONSE_FILE" 2>/dev/null || printf 'unknown')
+                    die "Empty Responses output with terminal status $response_status"
+                fi
+            fi
             if [[ -n "$max_empty_retries" && "$empty_retries" -ge "$max_empty_retries" ]]; then
                 break
             fi
             empty_retries=$((empty_retries + 1))
-            # llm's own stderr lines ("llm: warning: output truncated...")
-            # arrive mixed into the captured thinking; they are harness noise,
-            # not the model's reasoning, and must not become assistant content.
-            local feedback
-            feedback=$(printf '%s\n' "$thinking" | grep -Ev '^llm: (warning|note): ') || feedback=""
-            if [[ -n "$feedback" ]]; then
-                progress "Empty response — feeding thinking back to continue (retry $empty_retries${max_empty_retries:+/$max_empty_retries})..."
-                debug "empty_response_retry: fed back ${#feedback} chars of thinking"
-                # --rawfile, not --arg: a full-budget thinking block can exceed
-                # the OS's 128KB per-argument cap.
-                local feedback_file
-                feedback_file=$(mktemp)
-                printf '%s' "$feedback" > "$feedback_file"
-                retry_messages_json=$(printf '%s' "$retry_messages_json" | jq \
-                    --rawfile t "$feedback_file" \
-                    '. + [{"role":"assistant","content":$t},{"role":"user","content":"Your previous response ran out of output tokens during the reasoning above before you could emit any visible text. Continue from where you left off and produce the bash code for the next step now."}]')
-                rm -f "$feedback_file"
-                sleep 1
+            if [[ "$SHELLM_API_FORMAT" == "responses" ]]; then
+                progress "Incomplete Responses output — continuing from terminal response state (retry $empty_retries${max_empty_retries:+/$max_empty_retries})..."
+                retry_messages_json='[{"role":"user","content":"Continue from the incomplete response and emit the bash code for the next step."}]'
             else
-                progress "Empty response from API (retry $empty_retries${max_empty_retries:+/$max_empty_retries})..."
-                sleep 1
+                # llm's own stderr lines ("llm: warning: output truncated...")
+                # arrive mixed into the captured thinking; they are harness noise,
+                # not the model's reasoning, and must not become assistant content.
+                local feedback
+                feedback=$(printf '%s\n' "$thinking" | grep -Ev '^llm: (warning|note): ') || feedback=""
+                if [[ -n "$feedback" ]]; then
+                    progress "Empty response — feeding thinking back to continue (retry $empty_retries${max_empty_retries:+/$max_empty_retries})..."
+                    debug "empty_response_retry: fed back ${#feedback} chars of thinking"
+                    # --rawfile, not --arg: a full-budget thinking block can exceed
+                    # the OS's 128KB per-argument cap.
+                    local feedback_file
+                    feedback_file=$(mktemp)
+                    printf '%s' "$feedback" > "$feedback_file"
+                    retry_messages_json=$(printf '%s' "$retry_messages_json" | jq \
+                        --rawfile t "$feedback_file" \
+                        '. + [{"role":"assistant","content":$t},{"role":"user","content":"Your previous response ran out of output tokens during the reasoning above before you could emit any visible text. Continue from where you left off and produce the bash code for the next step now."}]')
+                    rm -f "$feedback_file"
+                else
+                    progress "Empty response from API (retry $empty_retries${max_empty_retries:+/$max_empty_retries})..."
+                fi
             fi
+            sleep 1
 
             : > "$thinking_file"
             response=$(call_llm "$system_prompt" "$retry_messages_json" "$thinking_file")

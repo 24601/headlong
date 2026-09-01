@@ -496,6 +496,9 @@ case "$LLM_API_FORMAT" in
             if [[ "$(jq -r '.background // false' "$LLM_RESPONSES_BODY_FILE")" == true ]]; then
                 die "background responses require lifecycle operations; use foreground Responses completion for now"
             fi
+            if jq -e 'has("conversation")' "$LLM_RESPONSES_BODY_FILE" >/dev/null 2>&1; then
+                die "conversation state cannot be combined with llm's previous_response_id continuation; omit conversation"
+            fi
         fi
         ;;
     *) die "Unknown LLM_API_FORMAT '$LLM_API_FORMAT' (expected chat or responses)" ;;
@@ -813,6 +816,10 @@ build_payload_responses() {
           else .previous_response_id = $previous end
         | if $effort == "" then .
           else .reasoning = ((.reasoning // {}) + {effort: $effort, summary: "auto"}) end
+        | .include = ((.include // [])
+            | if index("reasoning.encrypted_content") == null
+              then . + ["reasoning.encrypted_content"]
+              else . end)
     '
 }
 
@@ -1214,7 +1221,14 @@ _die_if_no_stream_data() {
         if printf '%s' "$_err_buf" | jq -e . >/dev/null 2>&1; then
             printf '%s' "$_err_buf" | write_response_file
             if printf '%s' "$_err_buf" | jq -e '
-                [(.error.param? // ""), (.error.code? // ""), (.error.message? // "")]
+                [
+                    (.error.param? // ""),
+                    (.error.code? // ""),
+                    (.error.message? // ""),
+                    (.param? // ""),
+                    (.code? // ""),
+                    (.message? // "")
+                ]
                 | map(tostring | ascii_downcase) | join(" ")
                 | test("previous[ _]response[ _]id|previous response")
             ' >/dev/null 2>&1; then
@@ -1225,7 +1239,7 @@ _die_if_no_stream_data() {
                 | write_response_file
         fi
     fi
-    _err=$(printf '%s' "$_err_buf" | jq -r '.error.message // empty' 2>/dev/null || true)
+    _err=$(printf '%s' "$_err_buf" | jq -r '.error.message // .message // empty' 2>/dev/null || true)
     if [[ "$_continuation_error" -eq 1 ]]; then
         die "API error: ${_err:-previous_response_id was rejected}"
     fi
@@ -1434,7 +1448,14 @@ stream_responses() {
                     if [[ -e "$LLM_DATA_MARKER" ]]; then
                         die "API stream error: $_error_msg"
                     elif printf '%s' "$json" | jq -e '
-                        [(.error.param? // ""), (.error.code? // ""), (.error.message? // "")]
+                        [
+                            (.error.param? // ""),
+                            (.error.code? // ""),
+                            (.error.message? // ""),
+                            (.param? // ""),
+                            (.code? // ""),
+                            (.message? // "")
+                        ]
                         | map(tostring | ascii_downcase) | join(" ")
                         | test("previous[ _]response[ _]id|previous response")
                     ' >/dev/null 2>&1; then
@@ -1760,6 +1781,12 @@ else
                 embedded_err="whitespace-only response body"
             fi
             if [[ -n "$embedded_err" ]]; then
+                if [[ "$LLM_API_FORMAT" == responses ]] \
+                    && jq -e '.status == "failed"' "$local_resp" >/dev/null 2>&1; then
+                    write_response_file < "$local_resp"
+                    rm -f "$local_resp"
+                    die "API error: $embedded_err"
+                fi
                 if [[ "$_attempt" -lt "$_max_attempts" ]]; then
                     rm -f "$local_resp"
                     echo "llm: transient API failure (attempt $_attempt/$_max_attempts): $embedded_err — retrying" >&2

@@ -83,6 +83,9 @@ case "$CURL_MODE" in
     stream-http-error)
         printf '%s\n' '{"error":{"message":"previous response missing","param":"previous_response_id","code":"previous_response_not_found"}}'
         ;;
+    stream-flat-error)
+        printf '%s\n\n' 'event: error' 'data: {"type":"error","message":"previous response missing","param":"previous_response_id","code":"previous_response_not_found"}'
+        ;;
     *)
         echo "curl stub: unknown CURL_MODE=$CURL_MODE" >&2
         exit 2
@@ -136,6 +139,9 @@ mode=$(stat -c %a "$WORK/response.json" 2>/dev/null || stat -f %Lp "$WORK/respon
 jq -e '.in_tok == 21 and .out_tok == 8 and .think_tok == 3' "$WORK/usage.json" >/dev/null \
     && ok "Responses usage maps to the existing usage contract" \
     || bad "Responses usage maps to the existing usage contract" "$(cat "$WORK/usage.json")"
+jq -e '(.include | index("reasoning.encrypted_content")) != null' "$CURL_PAYLOAD" >/dev/null \
+    && ok "Responses requests include encrypted reasoning for stateless replay" \
+    || bad "Responses requests include encrypted reasoning for stateless replay" "$(jq -c . "$CURL_PAYLOAD" 2>/dev/null)"
 
 # Buffered content parts concatenate byte-for-byte like SSE deltas; jq's
 # default record newlines must not alter the model's text.
@@ -193,6 +199,7 @@ if jq -e '
     .instructions == "real instructions" and
     .previous_response_id == "resp_previous" and
     .store == false and
+    (.include | index("reasoning.encrypted_content")) != null and
     .tools[0].name == "weather" and
     .text.format.type == "json_schema" and
     .reasoning.effort == "high" and
@@ -232,13 +239,14 @@ fi
 # A 200 Response with status=failed is not successful output.
 reset
 export CURL_MODE=buffered-failed
-run_openai --no-stream "fail" >"$WORK/stdout" 2>"$WORK/stderr"
+LLM_RETRIES=2 run_openai --no-stream "fail" >"$WORK/stdout" 2>"$WORK/stderr"
 rc=$?
 if [[ "$rc" -ne 0 ]] && grep -q 'generation failed' "$WORK/stderr" \
-   && jq -e '.status == "failed"' "$WORK/response.json" >/dev/null; then
-    ok "buffered failed Response fails and preserves terminal state"
+   && jq -e '.status == "failed"' "$WORK/response.json" >/dev/null \
+   && [[ "$(cat "$CURL_CALLS")" -eq 1 ]]; then
+    ok "buffered failed Response fails once and preserves terminal state"
 else
-    bad "buffered failed Response fails and preserves terminal state" "rc=$rc stderr=$(cat "$WORK/stderr")"
+    bad "buffered failed Response fails once and preserves terminal state" "rc=$rc calls=$(cat "$CURL_CALLS" 2>/dev/null) stderr=$(cat "$WORK/stderr")"
 fi
 
 # Non-2xx error envelopes are available to machine callers for safe fallback.
@@ -311,6 +319,19 @@ else
     bad "pre-SSE continuation rejection is preserved without internal retries" "rc=$rc calls=$(cat "$CURL_CALLS" 2>/dev/null) response=$(cat "$WORK/response.json" 2>/dev/null)"
 fi
 
+reset
+export CURL_MODE=stream-flat-error
+LLM_RETRIES=2 LLM_PREVIOUS_RESPONSE_ID=resp_missing \
+    run_openai "continue" >"$WORK/stdout" 2>"$WORK/stderr"
+rc=$?
+if [[ "$rc" -ne 0 ]] \
+   && jq -e '.param == "previous_response_id" and .code == "previous_response_not_found"' "$WORK/response.json" >/dev/null \
+   && [[ "$(cat "$CURL_CALLS")" -eq 1 ]]; then
+    ok "flat SSE continuation rejection is preserved without internal retries"
+else
+    bad "flat SSE continuation rejection is preserved without internal retries" "rc=$rc calls=$(cat "$CURL_CALLS" 2>/dev/null) response=$(cat "$WORK/response.json" 2>/dev/null)"
+fi
+
 # Provider and body validation fail before curl.
 reset
 export CURL_MODE=buffered-completed
@@ -343,8 +364,18 @@ else
     bad "background Responses are rejected until lifecycle support exists" "rc=$rc stderr=$(cat "$WORK/stderr")"
 fi
 
+printf '{"conversation":"conv_123"}' > "$WORK/body.json"
+LLM_API_FORMAT=responses LLM_RESPONSES_BODY_FILE="$WORK/body.json" \
+    "$LLM" --provider openai -m gpt-5.4-mini "no" >"$WORK/stdout" 2>"$WORK/stderr"
+rc=$?
+if [[ "$rc" -ne 0 ]] && grep -q 'conversation state cannot be combined' "$WORK/stderr"; then
+    ok "conversation state is rejected before continuation can conflict"
+else
+    bad "conversation state is rejected before continuation can conflict" "rc=$rc stderr=$(cat "$WORK/stderr")"
+fi
+
 # OpenRouter has its own Responses endpoint but remains a separate stateless
-# service from Ramp Router/openai-compatible.
+# service from generic openai-compatible endpoints.
 reset
 export CURL_MODE=buffered-completed
 LLM_API_FORMAT=responses LLM_RESPONSE_FILE="$WORK/response.json" \
@@ -353,6 +384,9 @@ LLM_API_FORMAT=responses LLM_RESPONSE_FILE="$WORK/response.json" \
 grep -q 'https://openrouter.ai/api/v1/responses' "$CURL_ARGS" \
     && ok "OpenRouter selects its documented Responses endpoint" \
     || bad "OpenRouter selects its documented Responses endpoint"
+jq -e '(.include | index("reasoning.encrypted_content")) != null' "$CURL_PAYLOAD" >/dev/null \
+    && ok "OpenRouter requests encrypted reasoning for exact replay" \
+    || bad "OpenRouter requests encrypted reasoning for exact replay" "$(jq -c . "$CURL_PAYLOAD" 2>/dev/null)"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [[ "$fail" -eq 0 ]]

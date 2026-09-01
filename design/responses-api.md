@@ -29,7 +29,11 @@ background responses, and WebSocket mode are separate lifecycle work.
 - `LLM_RESPONSES_BODY_FILE` may name a JSON object containing other synchronous
   create fields. `bin/llm` owns and overwrites `model`, `input`, `instructions`,
   `max_output_tokens`, `stream`, and `previous_response_id` so command-line and
-  continuation semantics remain deterministic.
+  continuation semantics remain deterministic. Conversation state is rejected
+  because it conflicts with this continuation contract.
+- Every create requests `reasoning.encrypted_content`, preserving exact
+  reasoning-item replay for stateless and Zero Data Retention paths while
+  retaining any other caller-supplied `include` values.
 - `LLM_PREVIOUS_RESPONSE_ID` adds stateful continuation.
 - `LLM_RESPONSE_FILE`, when set, receives the complete terminal Response object
   or provider error envelope through an atomic mode-0600 write. It is the

@@ -84,6 +84,28 @@ case "$LLM_STUB_MODE:$n" in
         write_response resp_3
         printf '%s\n' '```bash' 'FINAL=done-after-fallback' '```'
         ;;
+    empty:1)
+        ( umask 077; jq -nc '{
+            id: "resp_incomplete",
+            object: "response",
+            status: "incomplete",
+            incomplete_details: {reason: "max_output_tokens"},
+            output: [{id:"rs_incomplete", type:"reasoning", summary:[], encrypted_content:"enc_incomplete"}]
+        }' > "$LLM_RESPONSE_FILE" )
+        printf '%s\n' 'llm: warning: output truncated (max_output_tokens)' >&2
+        ;;
+    empty:2)
+        write_response resp_after_incomplete
+        printf '%s\n' '```bash' 'FINAL=done-after-incomplete' '```'
+        ;;
+    function:1)
+        ( umask 077; jq -nc '{
+            id: "resp_function",
+            object: "response",
+            status: "completed",
+            output: [{id:"fc_1", type:"function_call", call_id:"call_1", name:"weather", arguments:"{}", status:"completed"}]
+        }' > "$LLM_RESPONSE_FILE" )
+        ;;
     chat:1)
         [[ -z "${LLM_RESPONSE_FILE:-}" ]] || { echo "chat unexpectedly received LLM_RESPONSE_FILE" >&2; exit 2; }
         printf '%s\n' '```bash' 'FINAL=chat-done' '```'
@@ -202,6 +224,39 @@ if jq -e '
     ok "OpenRouter replay preserves reasoning and assistant phase items"
 else
     bad "OpenRouter replay preserves reasoning and assistant phase items" "$(jq -c . "$WORK/stub/messages-2.json" 2>/dev/null)"
+fi
+
+# A reasoning-only incomplete Response continues from the terminal Response
+# state. Its reasoning summary is never fabricated as an assistant message.
+run_shellm empty responses
+rc=$?
+if [[ "$rc" -eq 0 && "$(main_calls)" -eq 2 \
+    && "$(cat "$WORK/stub/previous-2")" == resp_incomplete ]]; then
+    ok "reasoning-only incomplete Response continues by response ID"
+else
+    bad "reasoning-only incomplete Response continues by response ID" "rc=$rc calls=$(main_calls) previous=$(cat "$WORK/stub/previous-2" 2>/dev/null)"
+fi
+
+if jq -e '
+    length == 1 and
+    .[0].role == "user" and
+    (. [0].content | contains("Continue from the incomplete response")) and
+    all(.[]; .role != "assistant")
+' "$WORK/stub/messages-2.json" >/dev/null 2>&1; then
+    ok "Responses retry does not fabricate assistant reasoning context"
+else
+    bad "Responses retry does not fabricate assistant reasoning context" "$(jq -c . "$WORK/stub/messages-2.json" 2>/dev/null)"
+fi
+
+# shellm cannot execute Responses-native function calls. It fails closed
+# instead of treating empty stdout as another model turn.
+run_shellm function responses
+rc=$?
+if [[ "$rc" -ne 0 && "$(main_calls)" -eq 1 ]] \
+    && grep -q 'function calls without visible shellm output' "$WORK/err"; then
+    ok "function-only Response fails closed without an empty-output retry"
+else
+    bad "function-only Response fails closed without an empty-output retry" "rc=$rc calls=$(main_calls) stderr=$(tail -5 "$WORK/err" | tr '\n' ' ')"
 fi
 
 # Invalid protocol configuration fails through shellm's normal error contract,
