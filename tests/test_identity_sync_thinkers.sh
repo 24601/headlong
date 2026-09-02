@@ -121,5 +121,19 @@ rm -f "$WORK/.identities/default"
 identity sync-thinkers alpha >/dev/null 2>&1
 check "works without a default identity" test $? -eq 0
 
+# Symlink installs link code but keep disabled markers identity-local. A fresh
+# identity receives the marker as a regular file; deleting it is a durable
+# enable choice across later syncs, while the bundled template stays disabled.
+mkdir -p "$HOME/.headlong-thinkers"
+touch "$HOME/.headlong-thinkers/.use-symlinks"
+identity new delta >/dev/null 2>&1
+TD="$WORK/.identities/delta/thinkers/gbrain-curator"
+check "symlink install copies disabled marker locally" \
+    bash -c '[[ -f "$1" && ! -L "$1" ]]' _ "$TD/disabled"
+rm -f "$TD/disabled"
+identity sync-thinkers delta >/dev/null 2>&1
+check_not "symlink sync preserves identity enable choice" test -e "$TD/disabled"
+check "bundled disabled template remains" test -f "$REPO/thinkers/gbrain-curator/disabled"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 exit $((fail > 0))

@@ -211,6 +211,8 @@ _ensure_thinkers() {
         local name
         name=$(basename "$src_dir")
         local dest="$thinkers_dir/$name"
+        local dest_was_new=0
+        [[ -e "$dest" || -L "$dest" ]] || dest_was_new=1
 
         # Guard: if a prior (mis)install left `dest` as a directory symlink
         # pointing back at the source, the file-level symlink pass below would
@@ -237,6 +239,19 @@ _ensure_thinkers() {
                 # subscriptions.jsonl is per-identity — only copy if missing
                 if [[ "$fname" == "subscriptions.jsonl" ]]; then
                     [[ -f "$dest/$fname" ]] || cp "$src_file" "$dest/$fname"
+                    continue
+                fi
+
+                # A bundled disabled marker is also identity-local. Seed it on
+                # first install and convert old symlink installs to a copy, but
+                # preserve its later removal as the operator's enable choice.
+                if [[ "$fname" == "disabled" ]]; then
+                    if [[ -L "$dest/$fname" ]]; then
+                        rm -f "$dest/$fname"
+                        cp "$src_file" "$dest/$fname"
+                    elif [[ "$dest_was_new" -eq 1 ]]; then
+                        cp "$src_file" "$dest/$fname"
+                    fi
                     continue
                 fi
 
