@@ -80,7 +80,7 @@ case "$ACTION" in
             [[ -d "$tdir" ]] || continue
             tname=$(basename "$tdir")
             [[ "$tname" == _* ]] && continue
-            [[ -f "$tdir/disabled" ]] && continue
+            [[ -f "$tdir/disabled" && ! -f "$tdir/enabled" ]] && continue
             [[ -f "$tdir/step" && -f "$tdir/subscriptions.jsonl" ]] || continue
             names+=("$tname")
         done

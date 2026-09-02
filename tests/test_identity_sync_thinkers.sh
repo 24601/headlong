@@ -50,6 +50,8 @@ T="$WORK/.identities/alpha/thinkers"
 
 check "fresh identity has monolith"     test -d "$T/monolith"
 check "fresh identity has responder"    test -d "$T/responder"
+check "fresh identity has GBrain recall" test -d "$T/gbrain-recall"
+check "GBrain recall defaults disabled" test -f "$T/gbrain-recall/disabled"
 check_not "fresh identity lacks actor"  test -d "$T/actor"
 
 check "fresh identity ledger seeded"    grep -qx actor "$T/.retired_done"
@@ -77,6 +79,13 @@ check_not "live monolith not disabled"  test -e "$T/monolith/disabled"
 check "responder bootstrapped back"     test -f "$T/responder/step"
 check "local prompt edit survives" \
     grep -q "nick's curated prompt" "$T/monolith/prompt.md"
+
+# A per-identity opt-in survives reconciliation while the bundled global
+# disabled marker remains present (the same marker works in copy/symlink mode).
+touch "$T/gbrain-recall/enabled"
+identity sync-thinkers alpha >/dev/null 2>&1
+check "GBrain recall opt-in survives sync" test -f "$T/gbrain-recall/enabled"
+check "global GBrain disabled marker remains" test -f "$REPO/thinkers/gbrain-recall/disabled"
 
 # Idempotent: a second run changes nothing and does not stack markers.
 marker_before=$(cat "$T/actor/disabled")
