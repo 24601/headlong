@@ -1355,7 +1355,7 @@ stream_openai() {
 
 stream_responses() {
     local _saw_data=0 _err_buf="" _chunk="" _event="" _response=""
-    local _text_emitted=0 _reasoning_emitted=0
+    local _text_emitted=0 _reasoning_emitted=0 _terminal=0
     while IFS= read -r raw_line || [[ -n "$raw_line" ]]; do
         local line="${raw_line%$'\r'}"
         if [[ "$line" == data:\ * ]]; then
@@ -1390,7 +1390,10 @@ stream_responses() {
                     ;;
                 response.completed|response.incomplete)
                     _response=$(printf '%s' "$json" | jq -c '.response // empty' 2>/dev/null) || _response=""
-                    if [[ -n "$_response" ]]; then
+                    if [[ -n "$_response" ]] \
+                        && printf '%s' "$_response" | jq -e --arg status "${_event#response.}" \
+                            '.status == $status' >/dev/null 2>&1; then
+                        _terminal=1
                         printf '%s' "$_response" | write_response_file
                         if [[ "$_reasoning_emitted" -eq 0 ]]; then
                             printf '%s' "$_response" | extract_reasoning_responses >&2
@@ -1452,6 +1455,12 @@ stream_responses() {
         fi
     done
     _die_if_no_stream_data
+    if [[ "$_terminal" -ne 1 ]]; then
+        if [[ -e "$LLM_DATA_MARKER" ]]; then
+            die "API stream error: Responses stream ended without a terminal response"
+        fi
+        die_retryable "API stream error: Responses stream ended without a terminal response"
+    fi
 }
 
 stream_gemini() {

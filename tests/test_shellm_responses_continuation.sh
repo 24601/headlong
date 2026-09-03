@@ -106,6 +106,9 @@ case "$LLM_STUB_MODE:$n" in
             output: [{id:"fc_1", type:"function_call", call_id:"call_1", name:"weather", arguments:"{}", status:"completed"}]
         }' > "$LLM_RESPONSE_FILE" )
         ;;
+    no-terminal:1)
+        printf '%s\n' '```bash' "touch '$LLM_STUB_DIR/executed'" '```'
+        ;;
     chat:1)
         [[ -z "${LLM_RESPONSE_FILE:-}" ]] || { echo "chat unexpectedly received LLM_RESPONSE_FILE" >&2; exit 2; }
         printf '%s\n' '```bash' 'FINAL=chat-done' '```'
@@ -257,6 +260,29 @@ if [[ "$rc" -ne 0 && "$(main_calls)" -eq 1 ]] \
     ok "function-only Response fails closed without an empty-output retry"
 else
     bad "function-only Response fails closed without an empty-output retry" "rc=$rc calls=$(main_calls) stderr=$(tail -5 "$WORK/err" | tr '\n' ' ')"
+fi
+
+# Defense in depth: even a malformed/custom llm that exits successfully after
+# visible output cannot make shellm execute without terminal Responses state.
+run_shellm no-terminal responses
+rc=$?
+if [[ "$rc" -ne 0 && "$(main_calls)" -eq 1 && ! -e "$WORK/stub/executed" ]] \
+    && grep -q 'without a terminal response' "$WORK/err"; then
+    ok "shellm rejects Responses output without terminal state before execution"
+else
+    bad "shellm rejects Responses output without terminal state before execution" "rc=$rc calls=$(main_calls) stderr=$(tail -5 "$WORK/err" | tr '\n' ' ')"
+fi
+
+# A bounded run context must never resend the pinned original prompt against an
+# existing continuation when its assistant boundary has fallen out of view.
+SHELLM_CONTEXT_SCOPE=run SHELLM_CONTEXT_RUN_TAIL=1 SHELLM_CONTEXT_RUN_TAIL_BLOCK=1 \
+    run_shellm continue responses
+rc=$?
+if [[ "$rc" -ne 0 && "$(main_calls)" -eq 1 ]] \
+    && grep -q 'continuation boundary fell outside' "$WORK/err"; then
+    ok "bounded context fails closed when its continuation boundary is absent"
+else
+    bad "bounded context fails closed when its continuation boundary is absent" "rc=$rc calls=$(main_calls) stderr=$(tail -5 "$WORK/err" | tr '\n' ' ')"
 fi
 
 # Invalid protocol configuration fails through shellm's normal error contract,

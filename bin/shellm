@@ -1548,11 +1548,13 @@ call_llm() {
     local system_prompt="$1"
     local full_messages_json="$2"
     local thinking_output_file="${3:-}"
+    local messages_are_delta="${4:-0}"
     local api_format="${SHELLM_API_FORMAT:-chat}"
     local response_file="${SHELLM_RESPONSE_FILE:-}"
     local response_id_file="${SHELLM_RESPONSE_ID_FILE:-}"
     local disabled_file="${SHELLM_RESPONSES_DISABLED_FILE:-}"
     local replay_file="${SHELLM_RESPONSES_REPLAY_FILE:-}"
+    local context_file="${SHELLM_RESPONSES_CONTEXT_FILE:-}"
     local stateless="${SHELLM_RESPONSES_STATELESS:-0}"
     local request_messages_json="$full_messages_json"
     local new_messages_json="$full_messages_json"
@@ -1580,13 +1582,22 @@ call_llm() {
             && ( -z "$disabled_file" || ! -e "$disabled_file" ) ]]; then
             previous_response_id=$(cat "$response_id_file")
         fi
-        if [[ -n "$previous_response_id" || "$replay_has_history" -eq 1 ]]; then
-            new_messages_json=$(printf '%s' "$full_messages_json" | jq '
-                . as $messages
+        if [[ "$messages_are_delta" != "1" \
+            && ( -n "$previous_response_id" || "$replay_has_history" -eq 1 ) ]]; then
+            [[ -n "$context_file" && -s "$context_file" ]] \
+                || die "Responses continuation context is missing"
+            new_messages_json=$(printf '%s' "$full_messages_json" | jq --slurpfile previous "$context_file" '
+                ($previous[0] // null) as $prior
+                | if ($prior | type) != "array" or type != "array"
+                    or .[0:($prior | length)] != $prior
+                  then error("previous Responses context is not a prefix of the rendered context")
+                  else .[($prior | length):]
+                  end
+                | . as $new
                 | (reduce range(0; length) as $i
-                    (-1; if $messages[$i].role == "assistant" then $i else . end)) as $last_assistant
-                | $messages[($last_assistant + 1):]
-            ')
+                    (0; if . == $i and $new[$i].role == "assistant" then . + 1 else . end)) as $start
+                | $new[$start:]
+            ') || die "Responses continuation boundary fell outside the rendered context; increase SHELLM_CONTEXT_RUN_TAIL"
         fi
         if [[ "$stateless" == "1" || ( -n "$disabled_file" && -e "$disabled_file" ) ]]; then
             if [[ "$replay_has_history" -eq 1 ]]; then
@@ -1650,6 +1661,13 @@ call_llm() {
         fi
 
         if [[ "$llm_exit" -eq 0 ]]; then
+            if [[ "$api_format" == "responses" ]] \
+                && { [[ -z "$response_file" || ! -s "$response_file" ]] \
+                    || ! jq -e '.status == "completed" or .status == "incomplete"' \
+                        "$response_file" >/dev/null 2>&1; }; then
+                rm -f "$text_file" "$stderr_file" "$messages_file"
+                die "llm returned Responses output without a terminal response"
+            fi
             if [[ "$api_format" == "responses" && -n "$response_file" \
                 && -s "$response_file" ]] \
                 && jq -e '.status == "completed" or .status == "incomplete"' \
@@ -1672,6 +1690,16 @@ call_llm() {
                         "$replay_file" "$turn_tmp" "$response_file" > "$replay_tmp"
                     mv -f "$replay_tmp" "$replay_file"
                     rm -f "$turn_tmp"
+                fi
+                if [[ -n "$context_file" && "$messages_are_delta" != "1" ]]; then
+                    local context_dir context_tmp
+                    context_dir=$(dirname "$context_file")
+                    mkdir -p "$context_dir"
+                    chmod 700 "$context_dir" 2>/dev/null || true
+                    context_tmp=$(mktemp "$context_dir/.responses-context.XXXXXX")
+                    chmod 600 "$context_tmp"
+                    printf '%s' "$full_messages_json" > "$context_tmp"
+                    mv -f "$context_tmp" "$context_file"
                 fi
 
                 local terminal_response_id
@@ -2541,12 +2569,14 @@ run_loop() {
     local SHELLM_RESPONSE_ID_FILE=""
     local SHELLM_RESPONSES_DISABLED_FILE=""
     local SHELLM_RESPONSES_REPLAY_FILE=""
+    local SHELLM_RESPONSES_CONTEXT_FILE=""
     local SHELLM_RESPONSES_STATELESS=0
     if [[ "$SHELLM_API_FORMAT" == "responses" ]]; then
         SHELLM_RESPONSE_FILE="$rundir/.last_response.json"
         SHELLM_RESPONSE_ID_FILE="$rundir/.response-id"
         SHELLM_RESPONSES_DISABLED_FILE="$rundir/.continuation-disabled"
         SHELLM_RESPONSES_REPLAY_FILE="$rundir/.responses-replay.json"
+        SHELLM_RESPONSES_CONTEXT_FILE="$rundir/.responses-context.json"
         ( umask 077; printf '[]' > "$SHELLM_RESPONSES_REPLAY_FILE" )
         chmod 600 "$SHELLM_RESPONSES_REPLAY_FILE"
 
@@ -2759,7 +2789,7 @@ run_loop() {
             sleep 1
 
             : > "$thinking_file"
-            response=$(call_llm "$system_prompt" "$retry_messages_json" "$thinking_file")
+            response=$(call_llm "$system_prompt" "$retry_messages_json" "$thinking_file" 1)
 
             thinking=""
             if [[ -s "$thinking_file" ]]; then

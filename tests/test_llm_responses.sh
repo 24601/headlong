@@ -86,6 +86,9 @@ case "$CURL_MODE" in
     stream-flat-error)
         printf '%s\n\n' 'event: error' 'data: {"type":"error","message":"previous response missing","param":"previous_response_id","code":"previous_response_not_found"}'
         ;;
+    stream-no-terminal)
+        printf '%s\n\n' 'event: response.output_text.delta' 'data: {"type":"response.output_text.delta","delta":"```bash\nprintf pwned\n```"}'
+        ;;
     *)
         echo "curl stub: unknown CURL_MODE=$CURL_MODE" >&2
         exit 2
@@ -330,6 +333,17 @@ if [[ "$rc" -ne 0 ]] \
     ok "flat SSE continuation rejection is preserved without internal retries"
 else
     bad "flat SSE continuation rejection is preserved without internal retries" "rc=$rc calls=$(cat "$CURL_CALLS" 2>/dev/null) response=$(cat "$WORK/response.json" 2>/dev/null)"
+fi
+
+reset
+export CURL_MODE=stream-no-terminal
+LLM_RETRIES=2 run_openai "truncated stream" >"$WORK/stdout" 2>"$WORK/stderr"
+rc=$?
+if [[ "$rc" -ne 0 && "$(cat "$CURL_CALLS")" -eq 1 && ! -e "$WORK/response.json" ]] \
+   && grep -q 'without a terminal response' "$WORK/stderr"; then
+    ok "Responses SSE with output but no terminal event fails without retry"
+else
+    bad "Responses SSE with output but no terminal event fails without retry" "rc=$rc calls=$(cat "$CURL_CALLS" 2>/dev/null) stderr=$(cat "$WORK/stderr")"
 fi
 
 # Provider and body validation fail before curl.
