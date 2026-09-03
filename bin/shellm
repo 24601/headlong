@@ -1616,7 +1616,10 @@ call_llm() {
         local -a args=(-m "$SHELLM_MODEL"
             --effort "$SHELLM_EFFORT" --thinking --system-prompt "$system_prompt" --messages-file "$messages_file")
         [[ -n "$SHELLM_MAX_TOKENS" ]] && args+=(-t "$SHELLM_MAX_TOKENS")
-        [[ "${SHELLM_STOP_AFTER_CODE_BLOCK:-1}" == 1 ]] && args+=(--stop-after-code-block)
+        # Responses needs the terminal event (id, usage, status). Cutting the
+        # stream at the first fence would drop it and break continuation.
+        [[ "${SHELLM_STOP_AFTER_CODE_BLOCK:-1}" == 1 && "$api_format" != responses ]] \
+            && args+=(--stop-after-code-block)
 
         if [[ "$api_format" == "responses" ]]; then
             if [[ -n "$previous_response_id" ]]; then
@@ -1707,20 +1710,10 @@ call_llm() {
         # disabled so an endpoint cannot trap shellm in a fallback loop.
         if [[ "$api_format" == "responses" && -n "$previous_response_id" \
             && "$fallback_used" -eq 0 && -n "$response_file" && -s "$response_file" ]] \
-            && jq -e '
-                [
-                    .error.param?,
-                    .error.code?,
-                    .error.message?,
-                    .param?,
-                    .code?,
-                    .message?,
-                    .detail?
-                ]
-                | map(select(. != null) | tostring | ascii_downcase)
-                | join(" ")
-                | test("previous[ _]response[ _]id|previous response")
-            ' "$response_file" >/dev/null 2>&1; then
+            && jq -e '[.error.param?,.error.code?,.error.message?,.param?,.code?,.message?,.detail?]
+                      | map(select(. != null) | tostring | ascii_downcase) | join(" ")
+                      | test("previous[ _]response[ _]id|previous response")' \
+                "$response_file" >/dev/null 2>&1; then
             [[ -z "$response_id_file" ]] || rm -f "$response_id_file"
             if [[ -n "$disabled_file" ]]; then
                 local disabled_dir disabled_tmp

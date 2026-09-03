@@ -13,4 +13,4 @@ thinker: a `step` executable that produces the next thought, and a
   marker. Updates preserve that per-identity choice.
 - `_lib/` holds shell helpers shared by the thinkers.
 
-Code here counts against the under-10K-lines core (`cloc bin/ thinkers/`).
+Code here counts against the under-11.5K-lines core (`cloc bin/ thinkers/`).

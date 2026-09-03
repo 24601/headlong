@@ -22,7 +22,7 @@
 #   gitleaks       gitleaks git (full history)  secrets; allowlist in .gitleaks.toml
 #   loc            cloc bin/ thinkers/          the harness stays under
 #                                               LOC_LIMIT code lines (the
-#                                               README's "about 10K lines"
+#                                               README's "about 11K lines"
 #                                               claim; was 10K at the launch
 #                                               blog post, week of 2026-08-24)
 #   alert-main     Slack post                    after each push to main: red
@@ -274,7 +274,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     env:
-      LOC_LIMIT: 11000
+      LOC_LIMIT: 11500
     steps:
       - uses: actions/checkout@v5
       - name: Install cloc

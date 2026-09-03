@@ -1212,6 +1212,13 @@ _llm_ledger_append() {
 # Streaming handlers
 # ---------------------------------------------------------------------------
 
+# True when a Responses error names previous_response_id (expiry, ZDR, etc.).
+_responses_prev_id_error() {
+    jq -e '[.error.param?,.error.code?,.error.message?,.param?,.code?,.message?,.detail?]
+           | map(select(. != null) | tostring | ascii_downcase) | join(" ")
+           | test("previous[ _]response[ _]id|previous response")' >/dev/null 2>&1
+}
+
 # Shared stream tail: if no SSE data arrived, the buffered lines are an API
 # error body. Reads the caller's _saw_data/_err_buf via dynamic scoping.
 _die_if_no_stream_data() {
@@ -1220,20 +1227,7 @@ _die_if_no_stream_data() {
     if [[ "$LLM_API_FORMAT" == responses && -n "$LLM_RESPONSE_FILE" ]]; then
         if printf '%s' "$_err_buf" | jq -e . >/dev/null 2>&1; then
             printf '%s' "$_err_buf" | write_response_file
-            if printf '%s' "$_err_buf" | jq -e '
-                [
-                    (.error.param? // ""),
-                    (.error.code? // ""),
-                    (.error.message? // ""),
-                    (.param? // ""),
-                    (.code? // ""),
-                    (.message? // "")
-                ]
-                | map(tostring | ascii_downcase) | join(" ")
-                | test("previous[ _]response[ _]id|previous response")
-            ' >/dev/null 2>&1; then
-                _continuation_error=1
-            fi
+            printf '%s' "$_err_buf" | _responses_prev_id_error && _continuation_error=1
         else
             jq -nc --arg message "$_err_buf" '{error:{message:$message}}' \
                 | write_response_file
@@ -1445,20 +1439,7 @@ stream_responses() {
                     printf '%s' "$json" | write_response_file
                     local _error_msg=""
                     _error_msg=$(printf '%s' "$json" | jq -r '.error.message // .message // "unknown error"' 2>/dev/null) || _error_msg="unknown error"
-                    if [[ -e "$LLM_DATA_MARKER" ]]; then
-                        die "API stream error: $_error_msg"
-                    elif printf '%s' "$json" | jq -e '
-                        [
-                            (.error.param? // ""),
-                            (.error.code? // ""),
-                            (.error.message? // ""),
-                            (.param? // ""),
-                            (.code? // ""),
-                            (.message? // "")
-                        ]
-                        | map(tostring | ascii_downcase) | join(" ")
-                        | test("previous[ _]response[ _]id|previous response")
-                    ' >/dev/null 2>&1; then
+                    if [[ -e "$LLM_DATA_MARKER" ]] || printf '%s' "$json" | _responses_prev_id_error; then
                         die "API stream error: $_error_msg"
                     else
                         die_retryable "API stream error: $_error_msg"
