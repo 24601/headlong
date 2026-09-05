@@ -1615,26 +1615,26 @@ call_llm() {
         # message that renders a row not yet sent; assistant rows are the
         # model's own turns, already held by previous_response_id or the
         # replay chain, and elision markers render no row at all.
-        # The set rides a file, not argv, and keeps insertion order capped
-        # well above the widest render window (SHELLM_CONTEXT_RUN_TAIL), so a
-        # long run cannot outgrow the OS's per-argument cap.
-        local seen_src=/dev/null sent_ids_json='[]'
+        # The set is a JSON object keyed by step id (constant-time lookup)
+        # that rides a file, not argv, and is never pruned: a pinned prompt
+        # renders on every call however old it is, so any eviction rule would
+        # eventually resend it. Growth is a few dozen bytes per turn.
+        local seen_src=/dev/null sent_ids_json='{}'
         [[ -n "$context_file" && -s "$context_file" ]] && seen_src="$context_file"
         if [[ "$messages_are_delta" != "1" \
             && ( -n "$previous_response_id" || "$replay_has_history" -eq 1 ) ]]; then
             [[ "$seen_src" != /dev/null ]] \
                 || die "Responses continuation context is missing"
             new_messages_json=$(printf '%s' "$full_messages_json" | jq -c --slurpfile seen_file "$seen_src" '
-                ($seen_file[0] // []) as $seen
+                ($seen_file[0] // {}) as $seen
                 | map(select(.role != "assistant"
-                             and ((.step_ids // []) | any(. as $s | ($seen | index($s)) == null))))
+                             and ((.step_ids // []) | any(. as $s | ($seen[$s] // false) | not))))
             ') || die "Responses continuation could not tell new rows from sent ones in the rendered context"
         fi
         if [[ "$messages_are_delta" != "1" ]]; then
             sent_ids_json=$(printf '%s' "$full_messages_json" | jq -c --slurpfile seen_file "$seen_src" '
-                ($seen_file[0] // []) as $seen
-                | ($seen + ([.[] | .step_ids[]?] | map(select(. as $s | ($seen | index($s)) == null)) | unique))
-                | .[-2000:]
+                ($seen_file[0] // {}) as $seen
+                | $seen + ([.[] | .step_ids[]?] | map({key: ., value: true}) | from_entries)
             ')
         fi
         # Nothing past this line may carry step_ids to a provider.

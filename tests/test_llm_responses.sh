@@ -479,6 +479,36 @@ if [[ "$rc" -ne 0 && ! -e "$CURL_CALLS" && ! -s "$WORK/stdout" ]] \
 else
     bad "an unwritable Response sidecar fails before any request" "rc=$rc calls=$(cat "$CURL_CALLS" 2>/dev/null) stderr=$(cat "$WORK/stderr")"
 fi
+# A path that names a directory would let mv "succeed" by dropping the temp
+# file inside it, with nothing at the path the caller reads.
+reset
+mkdir -p "$WORK/as-dir"
+LLM_API_FORMAT=responses LLM_RESPONSE_FILE="$WORK/as-dir" \
+    "$LLM" --provider openai -m gpt-5.4-mini "sidecar" >"$WORK/stdout" 2>"$WORK/stderr"
+rc=$?
+if [[ "$rc" -ne 0 && ! -e "$CURL_CALLS" && -d "$WORK/as-dir" ]] \
+   && grep -q 'Response file is a directory' "$WORK/stderr" \
+   && [[ -z "$(ls -A "$WORK/as-dir")" ]]; then
+    ok "a directory as Response sidecar fails before any request"
+else
+    bad "a directory as Response sidecar fails before any request" "rc=$rc calls=$(cat "$CURL_CALLS" 2>/dev/null) stderr=$(cat "$WORK/stderr")"
+fi
+reset
+mkdir -p "$WORK/locked" && chmod 500 "$WORK/locked"
+if [[ -w "$WORK/locked" ]]; then
+    ok "a read-only sidecar directory fails before any request (skipped: directory writable, probably root)"
+else
+    LLM_API_FORMAT=responses LLM_RESPONSE_FILE="$WORK/locked/response.json" \
+        "$LLM" --provider openai -m gpt-5.4-mini "sidecar" >"$WORK/stdout" 2>"$WORK/stderr"
+    rc=$?
+    if [[ "$rc" -ne 0 && ! -e "$CURL_CALLS" ]] \
+       && grep -q 'Response file directory is not writable' "$WORK/stderr"; then
+        ok "a read-only sidecar directory fails before any request"
+    else
+        bad "a read-only sidecar directory fails before any request" "rc=$rc calls=$(cat "$CURL_CALLS" 2>/dev/null) stderr=$(cat "$WORK/stderr")"
+    fi
+fi
+chmod 700 "$WORK/locked"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [[ "$fail" -eq 0 ]]

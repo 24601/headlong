@@ -514,8 +514,16 @@ case "$LLM_API_FORMAT" in
         # A sidecar the caller asked for must be writable before any tokens
         # are spent: the streaming handler cannot fail the call cleanly for a
         # missing directory once the reply is on its way.
-        if [[ -n "$LLM_RESPONSE_FILE" && ! -d "$(dirname "$LLM_RESPONSE_FILE")" ]]; then
-            die "Response file directory does not exist: $(dirname "$LLM_RESPONSE_FILE")"
+        if [[ -n "$LLM_RESPONSE_FILE" ]]; then
+            _response_dir=$(dirname "$LLM_RESPONSE_FILE")
+            [[ -d "$_response_dir" ]] \
+                || die "Response file directory does not exist: $_response_dir"
+            [[ -w "$_response_dir" ]] \
+                || die "Response file directory is not writable: $_response_dir"
+            # mv into an existing directory would "succeed" by dropping the
+            # temp file inside it, leaving no file at the path the caller reads.
+            [[ -d "$LLM_RESPONSE_FILE" ]] \
+                && die "Response file is a directory: $LLM_RESPONSE_FILE"
         fi
         ;;
     *) die "Unknown LLM_API_FORMAT '$LLM_API_FORMAT' (expected chat or responses)" ;;
@@ -1178,6 +1186,8 @@ write_response_file() {
         || die "Cannot create temporary Response file in: $response_dir"
     if ( umask 077; cat > "$response_tmp" ); then
         chmod 600 "$response_tmp" 2>/dev/null || true
+        [[ -d "$LLM_RESPONSE_FILE" ]] \
+            && { rm -f "$response_tmp"; die "Response file is a directory: $LLM_RESPONSE_FILE"; }
         mv -f "$response_tmp" "$LLM_RESPONSE_FILE" \
             || { rm -f "$response_tmp"; die "Cannot write Response file: $LLM_RESPONSE_FILE"; }
     else
