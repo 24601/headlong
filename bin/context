@@ -15,6 +15,8 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 
 CTX_HEAD="${CTX_HEAD:-1}"
+CTX_IDS=0
+CTX_MERGE=1
 CTX_TAIL="${CTX_TAIL:-50}"
 CTX_TAIL_BLOCK="${CTX_TAIL_BLOCK:-1}"
 CTX_PROMPT_LIMIT="${SHELLM_STDOUT_PROMPT_LIMIT:-2048}"
@@ -58,6 +60,12 @@ Step selection:
                         changes once per B appended rows instead of on every
                         call (keeps provider prompt caches warm). Default: 1.
   --pin <step_id>       Always include this step. Repeatable.
+  --ids                 Tag each message with step_ids: the rows it renders
+                        ([] for an elision marker). For callers that must
+                        tell new rows from re-rendered ones.
+  --no-merge            Keep consecutive same-role messages separate (the
+                        default merges them for APIs that require
+                        alternation). One row, one message.
   --run RUN_ID          Keep only steps whose run_id is RUN_ID (pins always
                         stay). Steps of other runs never render and never
                         count as elided; a gap inside the run renders as
@@ -105,6 +113,8 @@ while [[ $# -gt 0 ]]; do
         --tail)             CTX_TAIL="${2:?--tail requires N}"; shift 2 ;;
         --tail-block)       CTX_TAIL_BLOCK="${2:?--tail-block requires B}"; shift 2 ;;
         --pin)              CTX_PINS+=("${2:?--pin requires step_id}"); shift 2 ;;
+        --ids)              CTX_IDS=1; shift ;;
+        --no-merge)         CTX_MERGE=0; shift ;;
         --prompt-limit)     CTX_PROMPT_LIMIT="${2:?--prompt-limit requires BYTES}"; shift 2 ;;
         --block-limit)      CTX_BLOCK_LIMIT="${2:?--block-limit requires BYTES}"; shift 2 ;;
         --whole-blocks)     CTX_WHOLE_BLOCKS="${2:?--whole-blocks requires W}"; shift 2 ;;
@@ -353,22 +363,25 @@ def render_step($limit0; $blobs; $full):
 def build_messages($kept; $limit; $blobs; $elision; $total; $skip; $full; $run):
   def gap_between($a; $b):
     ($b - $a - 1) - ([$skip[] | select(. > $a and . < $b)] | length);
+  # --ids: a rendered row carries its step_id; a marker carries none.
+  def tag($m; $sids): if $ids == 1 then $m + {step_ids: $sids} else $m end;
   def marker($gap; $first):
-    if $run == "" then [{role: "user", content: "[\($gap) steps elided]"}]
+    if $run == "" then [tag({role: "user", content: "[\($gap) steps elided]"}; [])]
     elif $first then []
-    else [{role: "user", content: "[earlier steps elided]"}] end;
+    else [tag({role: "user", content: "[earlier steps elided]"}; [])] end;
   reduce $kept[] as $it ({msgs: [], last: -1};
       gap_between(.last; $it.i) as $gap |
       (if $elision != "none" and $gap > 0
        then .msgs + marker($gap; .last == -1)
        else .msgs end) as $m |
       ($it.row | render_step(row_limit($it.i; $total; $limit; $blocklimit); $blobs; $full) | rtrim) as $c |
-      {msgs: (if $c == "" then $m else $m + [{role: $it.role, content: $c}] end),
+      {msgs: (if $c == "" then $m
+              else $m + [tag({role: $it.role, content: $c}; [($it.row.step_id | tostring)])] end),
        last: $it.i}
   ) |
   (gap_between(.last; $total) as $gap |
    if $elision != "none" and $gap > 0 and $run == ""
-   then .msgs + [{role: "user", content: "[\($gap) steps elided]"}]
+   then .msgs + [tag({role: "user", content: "[\($gap) steps elided]"}; [])]
    else .msgs end);
 
 # Merge consecutive same-role messages (Anthropic API requires alternation).
@@ -376,6 +389,9 @@ def merge_roles:
   reduce .[] as $msg ([];
       if (length > 0) and (.[-1].role == $msg.role) then
           .[-1].content += ("\n---\n" + $msg.content)
+          | if ($msg | has("step_ids"))
+            then .[-1].step_ids = ((.[-1].step_ids // []) + $msg.step_ids)
+            else . end
       else . + [$msg]
       end
   );
@@ -412,7 +428,8 @@ if $mode == "refs" then
     ] | unique | .[]
 else
     $N,
-    (build_messages($kept; $limit; $blobs; $elision; $total; $skip; $FULL; $run) | merge_roles)
+    (build_messages($kept; $limit; $blobs; $elision; $total; $skip; $FULL; $run)
+     | if $merge == 1 then merge_roles else . end)
 end
 JQEOF
 )
@@ -481,6 +498,8 @@ _ctx_jq() {
         --argjson limit "$2" \
         --argjson blocklimit "${4:-$2}" \
         --argjson pins "$PINS_JSON" \
+        --argjson ids "$CTX_IDS" \
+        --argjson merge "$CTX_MERGE" \
         --arg astr "$CTX_ASSISTANT_TYPES" \
         --arg ustr "$CTX_USER_TYPES" \
         --arg estr "$CTX_EXCLUDE_TYPES" \

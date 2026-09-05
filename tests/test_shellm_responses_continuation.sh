@@ -80,6 +80,29 @@ case "$LLM_STUB_MODE:$n" in
         printf '%s\n' 'llm: error: API error (HTTP 400): previous response is unavailable' >&2
         exit 1
         ;;
+    partial:1)
+        write_response resp_1
+        printf '%s\n' '```bash' 'printf "first output\n"' '```'
+        ;;
+    partial:2)
+        # Text was already streamed when the error arrived: not a rejection.
+        printf '%s\n' '```bash' 'echo partial'
+        ( umask 077; printf '%s' '{"error":{"message":"previous response is unavailable","param":"previous_response_id","code":"previous_response_not_found"}}' > "$LLM_RESPONSE_FILE" )
+        printf '%s\n' 'llm: error: API stream error: previous response is unavailable' >&2
+        exit 1
+        ;;
+    long:1)
+        write_response resp_1
+        printf '%s\n' '```bash' "printf '%03000d\\n' 1" '```'
+        ;;
+    long:2)
+        write_response resp_2
+        printf '%s\n' '```bash' 'echo second' '```'
+        ;;
+    long:3)
+        write_response resp_3
+        printf '%s\n' '```bash' 'FINAL=done-after-long' '```'
+        ;;
     fallback:3)
         write_response resp_3
         printf '%s\n' '```bash' 'FINAL=done-after-fallback' '```'
@@ -273,16 +296,56 @@ else
     bad "shellm rejects Responses output without terminal state before execution" "rc=$rc calls=$(main_calls) stderr=$(tail -5 "$WORK/err" | tr '\n' ' ')"
 fi
 
-# A bounded run context must never resend the pinned original prompt against an
-# existing continuation when its assistant boundary has fallen out of view.
+# The render shrinks an output once it ages out of the newest block, so the
+# earlier context is not a byte prefix of the later one. New rows are told
+# apart by id, and the run reaches its third call with only the new output.
+run_shellm long responses
+rc=$?
+if [[ "$rc" -eq 0 && "$(main_calls)" -eq 3 && "$(cat "$WORK/stub/previous-3")" == resp_2 ]] \
+   && jq -e '
+        length == 1 and .[0].role == "user"
+        and (.[0].content | contains("second"))
+        and (.[0].content | contains("000000") | not)
+   ' "$WORK/stub/messages-3.json" >/dev/null 2>&1 \
+   && jq -e 'any(.[]; .content | contains("000000"))' "$WORK/stub/messages-2.json" >/dev/null 2>&1; then
+    ok "continuation survives an older output shrinking in the render"
+else
+    bad "continuation survives an older output shrinking in the render" "rc=$rc calls=$(main_calls) prev3=$(cat "$WORK/stub/previous-3" 2>/dev/null) m3=$(jq -c 'map(.content |= .[0:60])' "$WORK/stub/messages-3.json" 2>/dev/null) stderr=$(tail -3 "$WORK/err" | tr '\n' ' ')"
+fi
+if ! grep -q 'step_ids' "$WORK/stub"/messages-*.json; then
+    ok "row ids never reach the provider"
+else
+    bad "row ids never reach the provider" "$(grep -l 'step_ids' "$WORK/stub"/messages-*.json | tr '\n' ' ')"
+fi
+
+# A rejection can only precede generation. An error naming
+# previous_response_id after text was streamed is a failed call, not a cue to
+# replay, and the partial text is never executed.
+run_shellm partial responses
+rc=$?
+if [[ "$rc" -ne 0 && "$(main_calls)" -eq 2 ]] \
+   && ! grep -q 'retrying once with exact replay' "$WORK/err" \
+   && grep -q 'llm failed' "$WORK/err"; then
+    ok "continuation fallback requires a call that emitted nothing"
+else
+    bad "continuation fallback requires a call that emitted nothing" "rc=$rc calls=$(main_calls) stderr=$(tail -3 "$WORK/err" | tr '\n' ' ')"
+fi
+
+# A bounded run context keeps working after its earlier rows scroll out of
+# view: the pinned prompt is never resent against an existing continuation,
+# and the run does not fail closed for it.
 SHELLM_CONTEXT_SCOPE=run SHELLM_CONTEXT_RUN_TAIL=1 SHELLM_CONTEXT_RUN_TAIL_BLOCK=1 \
     run_shellm continue responses
 rc=$?
-if [[ "$rc" -ne 0 && "$(main_calls)" -eq 1 ]] \
-    && grep -q 'continuation boundary fell outside' "$WORK/err"; then
-    ok "bounded context fails closed when its continuation boundary is absent"
+if [[ "$rc" -eq 0 && "$(main_calls)" -eq 2 && "$(cat "$WORK/stub/previous-2")" == resp_1 ]] \
+   && jq -e '
+        length >= 1
+        and all(.[]; .role == "user" and (.content | contains("do the task") | not))
+        and any(.[]; .content | contains("first output"))
+   ' "$WORK/stub/messages-2.json" >/dev/null 2>&1; then
+    ok "bounded run context sends only new rows, never the pinned prompt"
 else
-    bad "bounded context fails closed when its continuation boundary is absent" "rc=$rc calls=$(main_calls) stderr=$(tail -5 "$WORK/err" | tr '\n' ' ')"
+    bad "bounded run context sends only new rows, never the pinned prompt" "rc=$rc calls=$(main_calls) m2=$(jq -c 'map(.content |= .[0:60])' "$WORK/stub/messages-2.json" 2>/dev/null) stderr=$(tail -3 "$WORK/err" | tr '\n' ' ')"
 fi
 
 # Invalid protocol configuration fails through shellm's normal error contract,

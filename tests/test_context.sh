@@ -114,6 +114,33 @@ else
     bad "invariant/alternating-roles"
 fi
 
+# 1b. --ids tags every message with the rows it renders. Unmerged, a row is
+# one message with its own step_id and an elision marker carries none; merged
+# (the default), a message carries every row it merged. The content is the
+# same either way once the tags are stripped, and without the flag no key
+# appears.
+# shellcheck disable=SC2086
+if run_case basic --tail 5 $PROD --ids --no-merge | jq -e '
+        type == "array"
+        and all(.[]; has("step_ids") and (.step_ids | type == "array"))
+        and all(.[] | select(.content | test("steps elided")); .step_ids == [])
+        and all(.[] | select(.content | test("steps elided") | not);
+                (.step_ids | length == 1) and (.step_ids[0] | type == "string" and length > 0))
+    ' >/dev/null 2>&1 \
+   && run_case basic --tail 5 $PROD --ids | jq -e '
+        any(.[]; .step_ids | length > 1)
+        and ([.[] | .step_ids[]] | length) == ([.[] | .step_ids[]] | unique | length)
+    ' >/dev/null 2>&1 \
+   && diff -q <(run_case basic --tail 5 $PROD --ids | jq -c 'map(del(.step_ids))') \
+              <(run_case basic --tail 5 $PROD | jq -c .) >/dev/null 2>&1 \
+   && diff -q <(run_case basic --tail 5 $PROD --ids --no-merge | jq -r '.[].content' ) \
+              <(run_case basic --tail 5 $PROD --no-merge | jq -r '.[].content') >/dev/null 2>&1 \
+   && run_case basic $PROD | jq -e 'all(.[]; has("step_ids") | not)' >/dev/null 2>&1; then
+    ok "invariant/ids-tag-rows"
+else
+    bad "invariant/ids-tag-rows"
+fi
+
 # 2. Output is valid UTF-8 even when truncation hits multibyte characters.
 # shellcheck disable=SC2086
 if run_case multibyte --prompt-limit 100 $PROD 2>/dev/null | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1; then

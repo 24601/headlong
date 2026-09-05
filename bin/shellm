@@ -1084,8 +1084,12 @@ docker_setup() {
         fi
     fi
 
-    # Build mount flags for -f file directories.
-    for f in "${context_files[@]+"${context_files[@]}"}"; do
+    # Build mount flags for -f file directories, and for the Responses create
+    # body file, which nested llm/shellm calls inside the container read at
+    # the same absolute path.
+    local -a _ro_files=("${context_files[@]+"${context_files[@]}"}")
+    [[ -n "$SHELLM_RESPONSES_BODY_FILE" ]] && _ro_files+=("$SHELLM_RESPONSES_BODY_FILE")
+    for f in "${_ro_files[@]+"${_ro_files[@]}"}"; do
         local abs_path abs_dir
         abs_path=$(realpath "$f")
         abs_dir=$(dirname "$abs_path")
@@ -1604,23 +1608,39 @@ call_llm() {
             && ( -z "$disabled_file" || ! -e "$disabled_file" ) ]]; then
             previous_response_id=$(cat "$response_id_file")
         fi
+        # Rows already sent are known by step id (context --ids), never by
+        # rendered bytes: the render shrinks a row as it ages out of the
+        # newest block and slides its window, so byte prefixes drift while
+        # the rows themselves have not changed. New input is every user-side
+        # message that renders a row not yet sent; assistant rows are the
+        # model's own turns, already held by previous_response_id or the
+        # replay chain, and elision markers render no row at all.
+        # The set rides a file, not argv, and keeps insertion order capped
+        # well above the widest render window (SHELLM_CONTEXT_RUN_TAIL), so a
+        # long run cannot outgrow the OS's per-argument cap.
+        local seen_src=/dev/null sent_ids_json='[]'
+        [[ -n "$context_file" && -s "$context_file" ]] && seen_src="$context_file"
         if [[ "$messages_are_delta" != "1" \
             && ( -n "$previous_response_id" || "$replay_has_history" -eq 1 ) ]]; then
-            [[ -n "$context_file" && -s "$context_file" ]] \
+            [[ "$seen_src" != /dev/null ]] \
                 || die "Responses continuation context is missing"
-            new_messages_json=$(printf '%s' "$full_messages_json" | jq --slurpfile previous "$context_file" '
-                ($previous[0] // null) as $prior
-                | if ($prior | type) != "array" or type != "array"
-                    or .[0:($prior | length)] != $prior
-                  then error("previous Responses context is not a prefix of the rendered context")
-                  else .[($prior | length):]
-                  end
-                | . as $new
-                | (reduce range(0; length) as $i
-                    (0; if . == $i and $new[$i].role == "assistant" then . + 1 else . end)) as $start
-                | $new[$start:]
-            ') || die "Responses continuation boundary fell outside the rendered context; increase SHELLM_CONTEXT_RUN_TAIL"
+            new_messages_json=$(printf '%s' "$full_messages_json" | jq -c --slurpfile seen_file "$seen_src" '
+                ($seen_file[0] // []) as $seen
+                | map(select(.role != "assistant"
+                             and ((.step_ids // []) | any(. as $s | ($seen | index($s)) == null))))
+            ') || die "Responses continuation could not tell new rows from sent ones in the rendered context"
         fi
+        if [[ "$messages_are_delta" != "1" ]]; then
+            sent_ids_json=$(printf '%s' "$full_messages_json" | jq -c --slurpfile seen_file "$seen_src" '
+                ($seen_file[0] // []) as $seen
+                | ($seen + ([.[] | .step_ids[]?] | map(select(. as $s | ($seen | index($s)) == null)) | unique))
+                | .[-2000:]
+            ')
+        fi
+        # Nothing past this line may carry step_ids to a provider.
+        full_messages_json=$(printf '%s' "$full_messages_json" | jq -c 'map(del(.step_ids))')
+        new_messages_json=$(printf '%s' "$new_messages_json" | jq -c 'map(del(.step_ids))')
+        request_messages_json="$full_messages_json"
         if [[ "$stateless" == "1" || ( -n "$disabled_file" && -e "$disabled_file" ) ]]; then
             if [[ "$replay_has_history" -eq 1 ]]; then
                 request_messages_json=$(printf '%s' "$new_messages_json" \
@@ -1718,9 +1738,9 @@ call_llm() {
                     context_dir=$(dirname "$context_file")
                     mkdir -p "$context_dir"
                     chmod 700 "$context_dir" 2>/dev/null || true
-                    context_tmp=$(mktemp "$context_dir/.responses-context.XXXXXX")
+                    context_tmp=$(mktemp "$context_dir/.responses-sent-ids.XXXXXX")
                     chmod 600 "$context_tmp"
-                    printf '%s' "$full_messages_json" > "$context_tmp"
+                    printf '%s' "$sent_ids_json" > "$context_tmp"
                     mv -f "$context_tmp" "$context_file"
                 fi
 
@@ -1758,8 +1778,11 @@ call_llm() {
         # compatible endpoint does not implement continuation. Retry once with
         # the exact input/output-item replay chain, then leave continuation
         # disabled so an endpoint cannot trap shellm in a fallback loop.
+        # A rejection can only precede generation, so a call that already
+        # emitted text is not one; that text is discarded and the run fails.
         if [[ "$api_format" == "responses" && -n "$previous_response_id" \
-            && "$fallback_used" -eq 0 && -n "$response_file" && -s "$response_file" ]] \
+            && "$fallback_used" -eq 0 && -n "$response_file" && -s "$response_file" \
+            && ! -s "$text_file" ]] \
             && jq -e '[.error.param?,.error.code?,.error.message?,.param?,.code?,.message?,.detail?]
                       | map(select(. != null) | tostring | ascii_downcase) | join(" ")
                       | test("previous[ _]response[ _]id|previous response")' \
@@ -2612,7 +2635,7 @@ run_loop() {
         SHELLM_RESPONSE_ID_FILE="$rundir/.response-id"
         SHELLM_RESPONSES_DISABLED_FILE="$rundir/.continuation-disabled"
         SHELLM_RESPONSES_REPLAY_FILE="$rundir/.responses-replay.json"
-        SHELLM_RESPONSES_CONTEXT_FILE="$rundir/.responses-context.json"
+        SHELLM_RESPONSES_CONTEXT_FILE="$rundir/.responses-sent-ids.json"
         ( umask 077; printf '[]' > "$SHELLM_RESPONSES_REPLAY_FILE" )
         chmod 600 "$SHELLM_RESPONSES_REPLAY_FILE"
 
@@ -2734,6 +2757,11 @@ run_loop() {
             --exclude-types "shellm-run,run-summary"
             --full-types prompt
             --block-limit "$SHELLM_CONTEXT_BLOCK_LIMIT" --whole-blocks "$SHELLM_CONTEXT_WHOLE_BLOCKS")
+        # Responses continuation tells new rows from re-rendered ones by id
+        # (call_llm), one row per message so a sent row and a new one never
+        # share a message (Responses needs no role alternation); chat context
+        # stays byte-identical.
+        [[ "$SHELLM_API_FORMAT" == "responses" ]] && _ctx_args+=(--ids --no-merge)
         if [[ "$SHELLM_CONTEXT_SCOPE" == "run" ]]; then
             _ctx_args+=(--run "$_run_step_id" --head 0
                 --tail "$SHELLM_CONTEXT_RUN_TAIL" --tail-block "$SHELLM_CONTEXT_RUN_TAIL_BLOCK")

@@ -18,8 +18,11 @@ background responses, and WebSocket mode are separate lifecycle work.
 ## Wire contract
 
 - Native OpenAI defaults to `https://api.openai.com/v1/responses` in Responses
-  mode. OpenRouter defaults to `https://openrouter.ai/api/v1/responses`.
-  `openai-compatible` still requires the exact `LLM_API_URL` endpoint.
+  mode. OpenRouter defaults to `https://openrouter.ai/api/v1/responses`, and
+  the `LLM_OR_*` routing and privacy constraints ride the Responses payload
+  exactly as they ride chat (merged into any caller-supplied `provider`
+  object). `openai-compatible` still requires the exact `LLM_API_URL`
+  endpoint.
 - The existing messages input is passed as the Responses `input` array without
   reshaping. This preserves typed input/output items, images, files, assistant
   phases, reasoning items, function calls, and `function_call_output` items.
@@ -38,7 +41,9 @@ background responses, and WebSocket mode are separate lifecycle work.
 - `LLM_RESPONSE_FILE`, when set, receives the complete terminal Response object
   or provider error envelope through an atomic mode-0600 write. It is the
   machine-readable channel for response IDs, all output items, function calls,
-  encrypted reasoning, status, errors, and usage.
+  encrypted reasoning, status, errors, and usage. Its directory is checked
+  before the request is sent, and a write that fails after a streamed reply
+  fails the call rather than returning text without the promised artifact.
 
 The human-output contract does not change: visible `output_text` is stdout,
 reasoning summaries are stderr, and `--raw` prints the buffered API object.
@@ -79,15 +84,28 @@ Responses mode keeps completion state only for the current `shellm` process:
 
 1. The first call sends the trajectory-derived context in full.
 2. Later calls send only newly appended user-side context plus the stable
-   instructions and the previous response ID.
+   instructions and the previous response ID. New rows are told apart from
+   re-rendered ones by trajectory step id (`context --ids --no-merge`, one
+   row per message), never by comparing rendered bytes: the render shrinks a
+   row as it ages out of the newest block and slides its window, so byte
+   prefixes drift while the rows themselves have not changed. Assistant rows
+   are the model's own turns, already held by the response ID or the replay
+   chain, and are never resent. Ids are stripped before anything reaches the
+   provider.
 3. In parallel, shellm retains the original input and every terminal output
    item. This exact replay chain preserves encrypted reasoning and assistant
    `phase` values for stateless endpoints and Zero Data Retention accounts.
 4. If a continuation is rejected specifically because the previous response
    cannot be referenced, before any output is emitted, shellm retries once with
-   the replay chain and remains stateless for the rest of the run.
+   the replay chain and remains stateless for the rest of the run. A call that
+   already emitted text is not a rejection whatever its error says: the text
+   is discarded and the run fails.
 5. A resumed process starts a new chain from the durable trajectory. Remote
    response IDs are not persisted as durable trajectory state.
+
+`SHELLM_RESPONSES_BODY_FILE` is mounted read-only into the Docker sandbox at
+its host path, so nested `llm` and `shellm` calls inside the container read
+the same file.
 
 OpenRouter's Responses endpoint is stateless and therefore starts directly in
 replay mode. Native OpenAI and generic compatible endpoints use automatic

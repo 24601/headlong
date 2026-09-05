@@ -437,5 +437,48 @@ jq -e '(.include | index("reasoning.encrypted_content")) != null' "$CURL_PAYLOAD
     && ok "OpenRouter requests encrypted reasoning for exact replay" \
     || bad "OpenRouter requests encrypted reasoning for exact replay" "$(jq -c . "$CURL_PAYLOAD" 2>/dev/null)"
 
+
+# A pinned route or a ZDR/no-training constraint says where the prompt may go,
+# so it rides the Responses payload exactly as it rides chat, merged with any
+# provider object the caller's body file already carries.
+reset
+export CURL_MODE=buffered-completed
+printf '%s' '{"provider":{"sort":"price"}}' > "$WORK/or-body.json"
+LLM_API_FORMAT=responses LLM_RESPONSES_BODY_FILE="$WORK/or-body.json" \
+LLM_OR_ONLY=openai LLM_OR_DATA_COLLECTION=deny LLM_OR_ZDR=1 \
+    "$LLM" --provider openrouter -m openai/gpt-5 --no-stream "route" \
+    >"$WORK/stdout" 2>"$WORK/stderr"
+rc=$?
+if [[ "$rc" -eq 0 ]] && jq -e '
+    .provider == {sort:"price", only:["openai"], data_collection:"deny", zdr:true}
+    and .model == "openai/gpt-5" and (.input | type == "array")
+' "$CURL_PAYLOAD" >/dev/null; then
+    ok "OpenRouter routing and privacy constraints ride the Responses payload"
+else
+    bad "OpenRouter routing and privacy constraints ride the Responses payload" "rc=$rc payload=$(jq -c . "$CURL_PAYLOAD" 2>/dev/null)"
+fi
+reset
+export CURL_MODE=buffered-completed
+LLM_API_FORMAT=responses \
+    "$LLM" --provider openrouter -m openai/gpt-5 --no-stream "unpinned" \
+    >"$WORK/stdout" 2>"$WORK/stderr"
+jq -e 'has("provider") | not' "$CURL_PAYLOAD" >/dev/null \
+    && ok "unpinned OpenRouter Responses payload carries no provider object" \
+    || bad "unpinned OpenRouter Responses payload carries no provider object" "$(jq -c . "$CURL_PAYLOAD" 2>/dev/null)"
+
+# A sidecar the caller asked for must be writable before any tokens are
+# spent; a streaming reply cannot be failed cleanly for a missing directory.
+reset
+export CURL_MODE=stream-completed
+LLM_API_FORMAT=responses LLM_RESPONSE_FILE="$WORK/missing-dir/response.json" \
+    "$LLM" --provider openai -m gpt-5.4-mini "sidecar" >"$WORK/stdout" 2>"$WORK/stderr"
+rc=$?
+if [[ "$rc" -ne 0 && ! -e "$CURL_CALLS" && ! -s "$WORK/stdout" ]] \
+   && grep -q 'Response file directory does not exist' "$WORK/stderr"; then
+    ok "an unwritable Response sidecar fails before any request"
+else
+    bad "an unwritable Response sidecar fails before any request" "rc=$rc calls=$(cat "$CURL_CALLS" 2>/dev/null) stderr=$(cat "$WORK/stderr")"
+fi
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [[ "$fail" -eq 0 ]]
