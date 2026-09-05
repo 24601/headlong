@@ -58,6 +58,21 @@ item counts as output even when it is a function call with no visible text.
 After a text, reasoning, or output-item event, a truncated or failed stream is
 never replayed automatically.
 
+The shared stream retry loop keeps its pre-existing rule for every protocol:
+any failure before output is retried, whatever the handler's exit status (an
+Anthropic overloaded error arrives as an in-stream event and exits 1). The one
+exception is a rejected `previous_response_id`, which is deterministic. The
+Responses handler reports it through a private exit code (`die_permanent`) so
+the loop stops at once and `shellm` can fall back to its replay chain without
+waiting through retries. That decision is made on the error body alone and
+does not depend on `LLM_RESPONSE_FILE` being set.
+
+`LLM_STOP_AFTER_CODE_BLOCK` keeps its contract in Responses mode: the stream
+is cut when the first fenced block closes and the cut is a clean finish. The
+terminal event never arrives, so no sidecar is written and usage is estimated.
+`shellm` therefore does not request the cut in Responses mode, because its
+continuation needs the terminal object.
+
 ## shellm continuation
 
 Responses mode keeps completion state only for the current `shellm` process:

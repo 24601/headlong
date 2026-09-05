@@ -86,6 +86,11 @@ case "$CURL_MODE" in
     stream-flat-error)
         printf '%s\n\n' 'event: error' 'data: {"type":"error","message":"previous response missing","param":"previous_response_id","code":"previous_response_not_found"}'
         ;;
+    stream-stop-after)
+        printf '%s\n\n' 'event: response.output_text.delta' 'data: {"type":"response.output_text.delta","delta":"```bash\necho first\n```\n"}'
+        printf '%s\n\n' 'event: response.output_text.delta' 'data: {"type":"response.output_text.delta","delta":"trailing prose\n```bash\necho second\n```\n"}'
+        printf '%s\n\n' 'event: response.completed' 'data: {"type":"response.completed","response":{"id":"resp_cut","object":"response","status":"completed","output":[{"id":"msg_cut","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"```bash\necho first\n```\ntrailing prose\n```bash\necho second\n```\n"}]}],"usage":{"input_tokens":3,"output_tokens":9}}}'
+        ;;
     stream-no-terminal)
         printf '%s\n\n' 'event: response.output_text.delta' 'data: {"type":"response.output_text.delta","delta":"```bash\nprintf pwned\n```"}'
         ;;
@@ -333,6 +338,36 @@ if [[ "$rc" -ne 0 ]] \
     ok "flat SSE continuation rejection is preserved without internal retries"
 else
     bad "flat SSE continuation rejection is preserved without internal retries" "rc=$rc calls=$(cat "$CURL_CALLS" 2>/dev/null) response=$(cat "$WORK/response.json" 2>/dev/null)"
+fi
+
+# The same decision without a sidecar: the rejection is judged on the error
+# body, so a caller that sets no LLM_RESPONSE_FILE does not pay for retries
+# of a deterministic 400 either.
+reset
+export CURL_MODE=stream-http-error
+LLM_API_FORMAT=responses LLM_RETRIES=2 LLM_PREVIOUS_RESPONSE_ID=resp_missing \
+    "$LLM" --provider openai -m gpt-5.4-mini "continue" >"$WORK/stdout" 2>"$WORK/stderr"
+rc=$?
+if [[ "$rc" -eq 1 && "$(cat "$CURL_CALLS")" -eq 1 && ! -e "$WORK/response.json" ]] \
+   && grep -q 'previous response missing' "$WORK/stderr"; then
+    ok "continuation rejection is final without a Response sidecar"
+else
+    bad "continuation rejection is final without a Response sidecar" "rc=$rc calls=$(cat "$CURL_CALLS" 2>/dev/null) stderr=$(cat "$WORK/stderr")"
+fi
+
+# --stop-after-code-block keeps its contract in Responses mode: the stream is
+# cut when the first block closes, the cut is a clean finish, and the missing
+# terminal event means no sidecar and estimated usage.
+reset
+export CURL_MODE=stream-stop-after
+run_openai --stop-after-code-block "cut" >"$WORK/stdout" 2>"$WORK/stderr"
+rc=$?
+if [[ "$rc" -eq 0 && "$(cat "$WORK/stdout")" == $'```bash\necho first\n```' && ! -e "$WORK/response.json" ]] \
+   && grep -q 'stopped reading after the first code block' "$WORK/stderr" \
+   && jq -e '.estimated == true' "$WORK/usage.json" >/dev/null; then
+    ok "stop-after-code-block cuts a Responses stream cleanly"
+else
+    bad "stop-after-code-block cuts a Responses stream cleanly" "rc=$rc out=$(cat "$WORK/stdout") stderr=$(cat "$WORK/stderr") usage=$(cat "$WORK/usage.json" 2>/dev/null)"
 fi
 
 reset

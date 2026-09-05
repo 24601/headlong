@@ -169,6 +169,14 @@ die_retryable() {
     { [[ -n "${LLM_RETRY_ERR:-}" ]] && printf '%s' "$*" > "$LLM_RETRY_ERR" 2>/dev/null; } || true
     exit 75
 }
+# A failure seen before anything was emitted that a retry cannot fix (a
+# rejected previous_response_id in Responses mode): the stream retry loop
+# stops at once instead of replaying a deterministic error. Exit 76 is the
+# loop's private signal; the caller sees exit 1 like any other error.
+die_permanent() {
+    { [[ -n "${LLM_RETRY_ERR:-}" ]] && printf '%s' "$*" > "$LLM_RETRY_ERR" 2>/dev/null; } || true
+    exit 76
+}
 
 # Called by stream handlers the moment anything is emitted (stdout text or
 # thinking on stderr) — from that point on, failures must not retry.
@@ -371,7 +379,10 @@ Environment:
                            first block and drop the rest: a model that keeps
                            writing after its command no longer costs tokens
                            or wall time. Usage is then estimated
-                           (out_tok from bytes, estimated:true).
+                           (out_tok from bytes, estimated:true). Under
+                           LLM_API_FORMAT=responses the cut also skips the
+                           terminal event, so LLM_RESPONSE_FILE is not
+                           written for that call.
 
 Examples:
   llm -m claude-sonnet-4-5-20250929 "explain quicksort"
@@ -1224,9 +1235,12 @@ _responses_prev_id_error() {
 _die_if_no_stream_data() {
     [[ "$_saw_data" -eq 0 && -n "$_err_buf" ]] || return 0
     local _err _continuation_error=0
-    if [[ "$LLM_API_FORMAT" == responses && -n "$LLM_RESPONSE_FILE" ]]; then
+    if [[ "$LLM_API_FORMAT" == responses ]]; then
         if printf '%s' "$_err_buf" | jq -e . >/dev/null 2>&1; then
             printf '%s' "$_err_buf" | write_response_file
+            # Judged on the error body alone, sidecar or not: a rejected
+            # previous_response_id is deterministic, and replaying it only
+            # delays the caller's fallback to its exact replay chain.
             printf '%s' "$_err_buf" | _responses_prev_id_error && _continuation_error=1
         else
             jq -nc --arg message "$_err_buf" '{error:{message:$message}}' \
@@ -1235,7 +1249,7 @@ _die_if_no_stream_data() {
     fi
     _err=$(printf '%s' "$_err_buf" | jq -r '.error.message // .message // empty' 2>/dev/null || true)
     if [[ "$_continuation_error" -eq 1 ]]; then
-        die "API error: ${_err:-previous_response_id was rejected}"
+        die_permanent "API error: ${_err:-previous_response_id was rejected}"
     fi
     [[ -n "$_err" ]] && die_retryable "API error: $_err"
     die_retryable "API error: $_err_buf"
@@ -1371,7 +1385,7 @@ stream_responses() {
                     if [[ -n "$_chunk" ]]; then
                         mark_emitted
                         _text_emitted=1
-                        printf '%s' "$_chunk"
+                        _emit_text "$_chunk" || break
                     fi
                     ;;
                 response.reasoning_summary_text.delta)
@@ -1442,8 +1456,10 @@ stream_responses() {
                     printf '%s' "$json" | write_response_file
                     local _error_msg=""
                     _error_msg=$(printf '%s' "$json" | jq -r '.error.message // .message // "unknown error"' 2>/dev/null) || _error_msg="unknown error"
-                    if [[ -e "$LLM_DATA_MARKER" ]] || printf '%s' "$json" | _responses_prev_id_error; then
+                    if [[ -e "$LLM_DATA_MARKER" ]]; then
                         die "API stream error: $_error_msg"
+                    elif printf '%s' "$json" | _responses_prev_id_error; then
+                        die_permanent "API stream error: $_error_msg"
                     else
                         die_retryable "API stream error: $_error_msg"
                     fi
@@ -1455,6 +1471,10 @@ stream_responses() {
         fi
     done
     _die_if_no_stream_data
+    # Cut on purpose after the first code block (LLM_STOP_AFTER_CODE_BLOCK):
+    # the retry loop reads the stop marker as a clean finish. The terminal
+    # event never arrives, so there is no sidecar and usage is estimated.
+    [[ -n "${LLM_STOP_MARKER:-}" && -e "$LLM_STOP_MARKER" ]] && return 0
     if [[ "$_terminal" -ne 1 ]]; then
         if [[ -e "$LLM_DATA_MARKER" ]]; then
             die "API stream error: Responses stream ended without a terminal response"
@@ -1722,10 +1742,11 @@ if [[ "$LLM_STREAM" -eq 1 ]]; then
             _retry_msg="empty response: stream ended without emitting anything"
             _rc=1
         fi
-        _retryable=0
-        [[ "$_rc" -eq 75 || -n "$_ce" ]] && _retryable=1
-        [[ "$_retry_msg" == empty\ response:* ]] && _retryable=1
-        if [[ "$_emitted" -eq 0 && "$_retryable" -eq 1 \
+        # Anything that failed before output was emitted is retried (an
+        # Anthropic overloaded_error arrives as an in-stream error event and
+        # exits 1, not 75), with one exception: a handler that exited 76
+        # (die_permanent) saw an error a replay cannot fix.
+        if [[ "$_emitted" -eq 0 && "$_rc" -ne 76 \
             && "$_attempt" -lt "$_max_attempts" ]]; then
             echo "llm: transient API failure (attempt $_attempt/$_max_attempts): ${_retry_msg:-${_ce:-exit $_rc}} — retrying" >&2
             sleep $(( LLM_RETRY_BACKOFF * _attempt ))
@@ -1734,6 +1755,7 @@ if [[ "$LLM_STREAM" -eq 1 ]]; then
         # Exhausted or output already emitted: fail like before
         [[ -n "$_retry_msg" ]] && { _llm_note error "" "$_retry_msg"; die "$_retry_msg"; }
         [[ -n "$_ce" ]] && { _llm_note error "" "curl error: $_ce"; die "curl error: $_ce"; }
+        [[ "$_rc" -eq 76 ]] && exit 1
         exit "$_rc"   # mid-stream die already printed its message
     done
 else
@@ -1784,7 +1806,7 @@ else
                     continue
                 fi
                 if [[ "$LLM_API_FORMAT" == responses ]]; then
-                    printf '%s' "$(cat "$local_resp")" | write_response_file
+                    write_response_file < "$local_resp"
                 fi
                 rm -f "$local_resp"
                 die "API error: $embedded_err"

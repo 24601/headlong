@@ -118,6 +118,18 @@ case "$mode" in
         printf '{"choices":[{"message":{"content":"truncated tex"},"finish_reason":"length"}]}' > "$out_file"
         printf '200'
         ;;
+    sse-anthropic-error)   # Anthropic: an error event before any output (overloaded_error)
+        printf 'data: {"type":"message_start","message":{"usage":{"input_tokens":1}}}\n\n'
+        printf 'data: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}\n\n'
+        ;;
+    sse-anthropic-ok)      # Anthropic: one text block, then a clean stop
+        printf 'data: {"type":"message_start","message":{"usage":{"input_tokens":1}}}\n\n'
+        printf 'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n'
+        printf 'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}\n\n'
+        printf 'data: {"type":"content_block_stop","index":0}\n\n'
+        printf 'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}\n\n'
+        printf 'data: {"type":"message_stop"}\n\n'
+        ;;
     sse-finish-length)  # streamed output whose final chunk reports the cap
         printf 'data: {"choices":[{"delta":{"content":"truncated te"},"finish_reason":null}]}\n\n'
         printf 'data: {"choices":[{"delta":{"content":"x"},"finish_reason":null}]}\n\n'
@@ -163,6 +175,17 @@ check "persistent failure fails"     test "$rc" -ne 0
 check "no output on failure"         test -z "$out"
 check "three attempts then give up"  test "$(calls)" = "3"
 check "original error preserved"     grep -q "llm: error: API error: Provider returned error" "$WORK/stderr"
+
+# ---------------------------------------------------------------------------
+# Streaming (Anthropic): an in-stream error event before any output exits the
+# handler with 1, not 75 (overloaded_error arrives this way) -> still retried
+# ---------------------------------------------------------------------------
+
+reset $'sse-anthropic-error\nsse-anthropic-ok'
+out=$(ANTHROPIC_API_KEY=test-key LLM_RETRIES=2 "$LLM" -m claude-sonnet-4-5-20250929 "say ok" 2>"$WORK/stderr")
+check "anthropic pre-output error event retried" test "$?" -eq 0
+check "anthropic retry output correct"           test "$out" = "ok"
+check "anthropic two curl calls"                 test "$(calls)" = "2"
 
 # ---------------------------------------------------------------------------
 # LLM_RETRIES=0 restores single-shot behavior
