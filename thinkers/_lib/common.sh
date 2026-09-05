@@ -107,6 +107,90 @@ _prompt_section_reported() {
         | grep -q .
 }
 
+# Runtime line for the wake prompt: which commit the mind runs, when it was
+# checked out, and when this identity's thinker copies were last synced. Gives
+# a fact about the runtime a version to be keyed to — Audel spent ~half of all
+# reasoning steps on 2026-09-04 re-grepping bin/shellm and md5summing its own
+# thinkers every wake because nothing said whether they had changed. Prints
+# nothing (rc 0) when the app root is not a git checkout.
+_runtime_line() {
+    local root="" sha="" subject head_t sync_t tool
+    # The app root is the parent of the bin/ holding the mind's tools; try a
+    # few in case one is shadowed (tests stub shellm in a scratch dir).
+    for tool in shellm traj mem; do
+        root=$(cd "$(dirname "$(command -v "$tool" 2>/dev/null || echo /nonexistent/x)")/.." 2>/dev/null && pwd -P) || continue
+        sha=$(git -C "$root" rev-parse --short HEAD 2>/dev/null) && [[ -n "$sha" ]] && break
+        sha=""
+    done
+    [[ -n "$sha" ]] || return 0
+    subject=$(git -C "$root" log -1 --format=%s 2>/dev/null | cut -c1-60) || subject=""
+    head_t=$(_mtime_utc "$root/.git/HEAD")
+    sync_t=""
+    if [[ -d "${IDENTITY_DIR:-}/thinkers" ]]; then
+        local newest
+        newest=$(find "$IDENTITY_DIR/thinkers" -type f 2>/dev/null \
+            | while IFS= read -r f; do stat -c '%Y' "$f" 2>/dev/null || stat -f '%m' "$f" 2>/dev/null; done \
+            | sort -n | tail -1)
+        [[ -n "$newest" ]] && sync_t=$(_epoch_utc "$newest")
+    fi
+    printf 'Runtime: headlong %s (%s)%s%s. A fact about your own runtime that you verified under this commit holds until this line changes.\n' \
+        "$sha" "$subject" "${head_t:+, checked out $head_t}" "${sync_t:+; your thinkers synced $sync_t}"
+    return 0
+}
+
+_mtime_utc() {  # _mtime_utc <file> -> "YYYY-MM-DD HH:MMZ" or ""
+    local t
+    t=$(stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null) || { printf ''; return 0; }
+    _epoch_utc "$t"
+}
+
+_epoch_utc() {  # _epoch_utc <epoch> -> "YYYY-MM-DD HH:MMZ"
+    date -u -d "@$1" +'%Y-%m-%d %H:%MZ' 2>/dev/null || date -u -r "$1" +'%Y-%m-%d %H:%MZ' 2>/dev/null || printf ''
+}
+
+# Workspace section for the wake prompt: the working directory every wake
+# starts in, its directories with file counts, how many loose files sit at the
+# top, and the head of WORKSPACE.md if the mind keeps one. Replaces the
+# pwd/ls/find opening that took 12% of Audel's reasoning steps (2026-09-04).
+# Bounded: at most WORKSPACE_DIRS directories, counts capped at 5000.
+# Counts in the workspace section are rounded to two significant figures
+# ("about 3500") so the section, which sits in the cached prefix of every
+# call, does not change on every wake that adds one file.
+_coarse_count() {  # _coarse_count <n> [cap]
+    local n="$1" cap="${2:-}"
+    [[ -n "$cap" && "$n" -ge "$cap" ]] && { printf '%s+' "$cap"; return 0; }
+    if (( n < 100 )); then printf '%s' "$n"; return 0; fi
+    local digits=${#n}
+    local scale=$(( 10 ** (digits - 2) ))
+    printf 'about %s' "$(( (n + scale / 2) / scale * scale ))"
+}
+
+_workspace_section() {  # _workspace_section <workdir>
+    local wd="$1" d n loose lines=() cap=5000
+    [[ -d "$wd" ]] || return 0
+    local max="${WORKSPACE_DIRS:-12}"
+    while IFS= read -r d; do
+        [[ -n "$d" ]] || continue
+        n=$(find "$d" -type f 2>/dev/null | head -n "$cap" | wc -l | tr -d ' ')
+        lines+=("$(printf '%s\t%s' "$n" "${d##*/}/")")
+    done < <(find "$wd" -mindepth 1 -maxdepth 1 -type d ! -name '.*' ! -name '__pycache__' 2>/dev/null | sort)
+    loose=$(find "$wd" -mindepth 1 -maxdepth 1 -type f ! -name '.*' 2>/dev/null | wc -l | tr -d ' ')
+    printf 'Workspace: %s (every wake starts here; paths below are relative to it)\n' "$wd"
+    if [[ ${#lines[@]} -gt 0 ]]; then
+        printf '%s\n' "${lines[@]}" | sort -t$'\t' -k1,1nr | head -n "$max" \
+            | while IFS=$'\t' read -r n d; do printf -- '- %s %s files\n' "$d" "$(_coarse_count "$n" "$cap")"; done
+        [[ ${#lines[@]} -gt "$max" ]] && printf -- '- and %d more directories\n' $(( ${#lines[@]} - max ))
+    fi
+    printf -- '- %s loose files at the top level\n' "$(_coarse_count "$loose")"
+    if [[ -f "$wd/WORKSPACE.md" ]]; then
+        printf 'WORKSPACE.md (yours to keep current; first lines):\n'
+        head -n 8 "$wd/WORKSPACE.md" | cut -c1-160
+    else
+        printf 'No WORKSPACE.md yet: write one (what lives where, what is in progress) and it is shown here.\n'
+    fi
+    return 0
+}
+
 # Build the common system prompt prefix shared by all thinkers.
 # Calls `identity prompt` and `skills prompt` to assemble identity context.
 _build_system_prompt() {
@@ -500,6 +584,28 @@ collect_skill_vars() {
     fi
 }
 
+# Bare `--var NAME` is resolved from shellm's inherited environment. Export
+# skill values in the caller before flag assembly runs in process substitution,
+# whose subshell cannot export anything back to its parent.
+_export_skill_vars() {
+    local identity_dir="$1" vname
+    while IFS= read -r vname; do
+        [[ -n "$vname" && -n "${!vname:-}" ]] && export "${vname?}"
+    done < <(collect_skill_vars "$identity_dir")
+    # Callers run under set -e: a declared-but-unset last var must not end the
+    # function on a false test (it killed every Audel wake on 2026-09-05).
+    return 0
+}
+
+_export_provider_keys() {
+    local vname
+    for vname in ANTHROPIC_API_KEY OPENAI_API_KEY GEMINI_API_KEY OPENROUTER_API_KEY \
+                 OPENCODE_API_KEY LLM_API_KEY; do
+        [[ -n "${!vname:-}" ]] && export "${vname?}"
+    done
+    return 0
+}
+
 # ---------------------------------------------------------------------------
 # Path resolution
 # ---------------------------------------------------------------------------
@@ -546,12 +652,13 @@ _build_shellm_flags() {
     [[ -n "${SHELLM_MODEL:-}" ]] && printf '%s\n' "--var" "SHELLM_MODEL=$SHELLM_MODEL"
     # The generic openai-compatible provider is env-configured and never
     # auto-detected, so nested calls need the provider name (routing, not a
-    # secret) and its key (bare name, like the vendor keys below).
+    # secret) and key. Endpoint variables are inherited rather than repeated
+    # as --var: shellm rewrites their values for Docker, and a duplicate extra
+    # var would overwrite that rewritten value in generated code.
     [[ -n "${LLM_PROVIDER:-}" ]] && printf '%s\n' "--var" "LLM_PROVIDER=$LLM_PROVIDER"
     for _ak in ANTHROPIC_API_KEY OPENAI_API_KEY GEMINI_API_KEY OPENROUTER_API_KEY \
                OPENCODE_API_KEY LLM_API_KEY; do
         if [[ -n "${!_ak:-}" ]]; then
-            export "${_ak?}"
             printf '%s\n' "--var" "$_ak"
         fi
     done
@@ -559,8 +666,16 @@ _build_shellm_flags() {
     # Skill-declared vars
     while IFS= read -r vname; do
         [[ -z "$vname" ]] && continue
+        # shellm owns endpoint alias resolution and Docker rewriting. Emitting
+        # either alias again as an extra var would overwrite its canonical URL.
+        case "$vname" in LLM_API_URL|SHELLM_API_URL) continue ;; esac
         local vval="${!vname:-}"
-        [[ -n "$vval" ]] && printf '%s\n' "--var" "$vname=$vval"
+        if [[ -n "$vval" ]]; then
+            # Skills commonly declare credentials and service endpoints. Keep
+            # every declared value off argv rather than trying to infer which
+            # names are sensitive.
+            printf '%s\n' "--var" "$vname"
+        fi
     done < <(collect_skill_vars "$identity_dir")
 
     # Standard binaries. Keep this in sync with the tools promised to the
